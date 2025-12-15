@@ -70,6 +70,7 @@ docker run -e DRIME_API_KEY=your-key -p 8081:8081 drime-s3
 - AWS CLI v2
 - Duplicati Backup
 - S3 Browser
+- Restic
 
 ## License
 
