@@ -176,12 +176,23 @@ class S3Gateway:
                     current_pid = folder_data.get("id")
                 except Exception as e:
                     if "422" in str(e):
-                        # Folder exists but not found - race condition
-                        entries = self.client.list_folder(current_pid)
-                        for e2 in entries:
-                            if e2.name.lower() == folder_name.lower() and e2.is_folder:
-                                current_pid = e2.id
+                        # Folder exists but not found - race condition, retry list multiple times
+                        found_after_retry = False
+                        for retry in range(3):
+                            import time
+                            time.sleep(0.1 * (retry + 1))  # Small delay before retry
+                            entries = self.client.list_folder(current_pid)
+                            for e2 in entries:
+                                if e2.name.lower() == folder_name.lower() and e2.is_folder:
+                                    current_pid = e2.id
+                                    found_after_retry = True
+                                    break
+                            if found_after_retry:
                                 break
+                        if not found_after_retry:
+                            logger.warning(f"Could not find folder '{folder_name}' after 422 error, parent_id={current_pid}")
+                            # Don't update current_pid - this will cause upload to wrong folder
+                            raise Exception(f"Race condition: folder '{folder_name}' not found after 422")
                     else:
                         raise
         

@@ -18,12 +18,12 @@ class DrimeClient:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get("DRIME_API_KEY", "")
         self.api_url = "https://app.drime.cloud/api/v1"
-        self.timeout = 60.0
+        self.timeout = 120.0
         
         if not self.api_key:
             raise ValueError("DRIME_API_KEY environment variable required")
     
-    def _request(self, method: str, endpoint: str, retries: int = 3, **kwargs) -> httpx.Response:
+    def _request(self, method: str, endpoint: str, retries: int = 5, **kwargs) -> httpx.Response:
         """Make authenticated API request with retry logic."""
         import time
         
@@ -78,8 +78,8 @@ class DrimeClient:
                 entries.append(FileEntry.from_dict(item))
             
             # Check pagination
-            meta = data.get("meta", {})
-            if page >= meta.get("last_page", 1):
+            last_page = data.get("last_page", 1)
+            if page >= last_page:
                 break
             page += 1
         
