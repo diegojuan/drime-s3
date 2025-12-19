@@ -6,11 +6,13 @@ import json
 import logging
 import os
 import shutil
+import base64
 import tempfile
 from email.utils import formatdate
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from xml.etree.ElementTree import Element, tostring
+from xml.etree.ElementTree import Element, tostring, fromstring
+from urllib.parse import parse_qs
 
 import httpx
 
@@ -88,6 +90,12 @@ class S3Gateway:
         
         # Folder cache
         self._folder_cache: Dict[str, int] = {}
+        
+        # Multipart Size Cache (UploadID -> Size) - from Init headers
+        self._upload_size_cache: Dict[str, int] = {}
+        
+        # Multipart Parts Size Tracker (UploadID -> {PartNum: Size}) - accumulated during upload
+        self._upload_parts_sizes: Dict[str, Dict[int, int]] = {}
     
     def _load_metadata(self):
         try:
@@ -113,6 +121,26 @@ class S3Gateway:
         if entry.description and entry.description.startswith("md5:"):
             return f'"{entry.description[4:]}"'
         return f'"{entry.hash}"' if entry.hash else '"unknown"'
+
+    def _encode_multipart_id(self, upload_id: str, key: str) -> str:
+        """Encode internal uploadId and key into a single S3 UploadID."""
+        data = json.dumps({"uid": upload_id, "key": key}).encode("utf-8")
+        return base64.urlsafe_b64encode(data).decode("utf-8")
+
+    def _decode_multipart_id(self, composite_id: str) -> Tuple[str, str]:
+        """Decode S3 UploadID back to internal uploadId and key."""
+        try:
+            composite_id = composite_id.strip()
+            missing_padding = len(composite_id) % 4
+            if missing_padding:
+                composite_id += '=' * (4 - missing_padding)
+            
+            data = base64.urlsafe_b64decode(composite_id)
+            decoded = json.loads(data)
+            return decoded["uid"], decoded["key"]
+        except Exception as e:
+            logger.error(f"Failed to decode UploadId {composite_id}: {e}")
+            raise ValueError("Invalid UploadId")
     
     def _resolve_key(self, key: str) -> Tuple[Optional[FileEntry], Optional[int], str]:
         """Resolve S3 key to Drime FileEntry."""
@@ -201,8 +229,10 @@ class S3Gateway:
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "/")
         method = environ.get("REQUEST_METHOD", "GET")
+        query_string = environ.get("QUERY_STRING", "")
+        params = parse_qs(query_string, keep_blank_values=True)
         
-        logger.info(f"S3 Request: {method} {path}")
+        logger.info(f"S3 Request: {method} {path} ?{query_string}")
         
         try:
             if path == "/":
@@ -215,13 +245,18 @@ class S3Gateway:
             else:
                 bucket, key = path, ""
             
+            # Multipart Indicators
+            is_multipart_init = "uploads" in params
+            upload_id = params.get("uploadId", [None])[0]
+            part_number = params.get("partNumber", [None])[0]
+
             if method == "GET":
                 if not key:
                     return self.handle_list_bucket(environ, start_response, bucket)
                 return self.handle_get_object(environ, start_response, bucket, key)
             elif method == "HEAD":
                 if not key:
-                    # HEAD bucket - return 200 if bucket exists
+                    # HEAD bucket
                     if bucket == "default":
                         start_response("200 OK", [("Content-Length", "0")])
                         return []
@@ -229,11 +264,22 @@ class S3Gateway:
                 return self.handle_head_object(environ, start_response, bucket, key)
             elif method == "PUT":
                 if not key:
-                    # PUT bucket (CreateBucket) - pretend success
+                    # PUT bucket
                     start_response("200 OK", [("Content-Length", "0")])
                     return []
+                if part_number and upload_id:
+                     return self.handle_upload_part(environ, start_response, bucket, key, upload_id, part_number)
                 return self.handle_put_object(environ, start_response, bucket, key)
+            elif method == "POST" and key:
+                if is_multipart_init:
+                    return self.handle_create_multipart_upload(environ, start_response, bucket, key)
+                elif upload_id:
+                    return self.handle_complete_multipart_upload(environ, start_response, bucket, key, upload_id)
+                else:
+                    return self.send_error(start_response, "404 Not Found", "InvalidURI", "Unsupported POST request")
             elif method == "DELETE" and key:
+                if upload_id:
+                    return self.handle_abort_multipart_upload(environ, start_response, bucket, key, upload_id)
                 return self.handle_delete_object(environ, start_response, bucket, key)
 
             
@@ -255,9 +301,240 @@ class S3Gateway:
         start_response(status, resp_headers)
         return [content]
     
-    def send_error(self, start_response, status, code, message):
+    def send_error(self, start_response, status, code, message, include_body=True):
+        """Send standard S3 XML Error."""
         xml = create_xml_response("Error", {"Code": code, "Message": message})
+        
+        if not include_body:
+             headers = [
+                ("Content-Type", "application/xml"),
+                ("Content-Length", str(len(xml))),
+                ("Date", formatdate(usegmt=True)),
+                ("Server", "DrimeS3"),
+             ]
+             start_response(status, headers)
+             return []
+             
         return self.send_response(start_response, status, xml)
+
+    # ------------------ Multipart Handlers ------------------
+
+    def handle_create_multipart_upload(self, environ, start_response, bucket, key):
+        """Initiate Multipart Upload."""
+        try:
+            extension = os.path.splitext(key)[1].lstrip(".")
+            filename = os.path.basename(key)
+            dirname = os.path.dirname(key)
+            
+            # Resolve parent
+            parent_id = 0
+            if dirname:
+                try:
+                    parent_id = self._ensure_folder(dirname)
+                except:
+                     parent_id = 0
+            
+            # Attempt to get size from header if provided
+            size = 0
+            # Try custom headers first (Rclone can send metadata)
+            for header in ["HTTP_X_AMZ_META_SIZE", "HTTP_X_FILE_SIZE", "HTTP_CONTENT_LENGTH_RANGE"]:
+                 val = environ.get(header)
+                 if val:
+                     try:
+                         size = int(val)
+                         break
+                     except:
+                         pass
+                
+            init_data = {
+                "filename": filename,
+                "mime": "application/octet-stream",
+                "size": size, # Placeholder or 0
+                "extension": extension,
+                "relativePath": filename,
+                "workspaceId": 0,
+            }
+            if parent_id:
+                 init_data["parentId"] = parent_id
+
+            resp = self.client._request("POST", "/s3/multipart/create", json=init_data)
+            init_resp = resp.json()
+             
+            drime_upload_id = init_resp.get("uploadId")
+            drime_key = init_resp.get("key")
+             
+            if not drime_upload_id or not drime_key:
+                 raise Exception("Invalid multipart init response")
+            
+            # Cache the known size for completion
+            if size > 0:
+                self._upload_size_cache[drime_upload_id] = size
+             
+            # Create composite ID
+            composite_id = self._encode_multipart_id(drime_upload_id, drime_key)
+             
+            data = {
+                 "Bucket": bucket,
+                 "Key": key,
+                 "UploadId": composite_id
+            }
+            return self.send_response(start_response, "200 OK", create_xml_response("InitiateMultipartUploadResult", data))
+
+        except Exception as e:
+            logger.error(f"Multipart Init Failed: {e}")
+            return self.send_error(start_response, "500 Internal Error", "InternalError", str(e))
+
+    def handle_upload_part(self, environ, start_response, bucket, key, upload_id, part_number):
+        """Streaming Proxy for Upload Part."""
+        try:
+            drime_uid, drime_key = self._decode_multipart_id(upload_id)
+            part_num = int(part_number)
+            
+            # Get Signed URL
+            sign_req = {
+                "key": drime_key,
+                "uploadId": drime_uid,
+                "partNumbers": [part_num]
+            }
+            resp = self.client._request("POST", "/s3/multipart/batch-sign-part-urls", json=sign_req)
+            sign_data = resp.json()
+            
+            urls = sign_data.get("urls", [])
+            if not urls:
+                 raise Exception("No signed URL returned")
+            signed_url = urls[0]["url"]
+            
+            # Stream body to S3 with size tracking
+            content_length = environ.get("CONTENT_LENGTH")
+            cl_int = int(content_length) if content_length else 0
+            
+            # Track part size locally to calculate total later
+            if drime_uid not in self._upload_parts_sizes:
+                self._upload_parts_sizes[drime_uid] = {}
+            self._upload_parts_sizes[drime_uid][part_num] = cl_int
+            
+            stream = environ["wsgi.input"]
+            def input_reader():
+                while True:
+                    chunk = stream.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+            
+            headers = {"Content-Type": "application/octet-stream"}
+            if cl_int:
+                 headers["Content-Length"] = str(cl_int)
+            
+            with httpx.Client() as client:
+                s3_resp = client.put(signed_url, content=input_reader(), headers=headers, timeout=None)
+                s3_resp.raise_for_status()
+                
+                etag = s3_resp.headers.get("ETag", "").strip('"')
+                if not etag:
+                     etag = "no-etag"
+                
+                return self.send_response(start_response, "200 OK", b"", headers=[("ETag", f'"{etag}"')])
+
+        except Exception as e:
+            logger.error(f"Upload Part Failed: {e}")
+            return self.send_error(start_response, "500 Internal Error", "InternalError", str(e))
+
+    def handle_complete_multipart_upload(self, environ, start_response, bucket, key, upload_id):
+        """Complete Multipart Upload."""
+        try:
+            drime_uid, drime_key = self._decode_multipart_id(upload_id)
+            
+            # Parse XML for parts
+            length = int(environ.get("CONTENT_LENGTH", 0))
+            body = environ["wsgi.input"].read(length)
+            root = fromstring(body)
+            
+            # Handle XML namespace optionality
+            parts = []
+            ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+            
+            # Try namespaced first
+            items = root.findall(f"{ns}Part")
+            if not items:
+                items = root.findall("Part")
+                
+            for p in items:
+                pn = p.find(f"{ns}PartNumber") if p.find(f"{ns}PartNumber") is not None else p.find("PartNumber")
+                et = p.find(f"{ns}ETag") if p.find(f"{ns}ETag") is not None else p.find("ETag")
+                if pn is not None and et is not None:
+                     parts.append({
+                         "PartNumber": int(pn.text),
+                         "ETag": et.text.strip('"')
+                     })
+            
+            # Call complete
+            comp_resp = self.client._request("POST", "/s3/multipart/complete", json={
+                "key": drime_key,
+                "uploadId": drime_uid,
+                "parts": parts
+            })
+            logger.info(f"Multipart Complete Response: {comp_resp.json()}")
+            
+            # Create File Entry
+            filename = os.path.basename(key)
+            extension = os.path.splitext(key)[1].lstrip(".")
+            dirname = os.path.dirname(key)
+            parent_id = self._ensure_folder(dirname) if dirname else None
+            
+            # Recuperar tamaño del cache (Init header) o calcular sumando partes
+            final_size = self._upload_size_cache.pop(drime_uid, 0)
+            
+            if final_size == 0:
+                # Try to calculate from tracked parts
+                parts_sizes = self._upload_parts_sizes.pop(drime_uid, {})
+                for p in parts: # parts from XML
+                    pnum = p.get("PartNumber")
+                    if pnum in parts_sizes:
+                        final_size += parts_sizes[pnum]
+                
+                if final_size == 0 and parts_sizes:
+                     # Fallback simple sum if missing XML match
+                     final_size = sum(parts_sizes.values())
+            else:
+                 # Cleanup parts cache anyway
+                 self._upload_parts_sizes.pop(drime_uid, None)
+            
+            entry_data = {
+                "clientMime": "application/octet-stream",
+                "clientName": filename,
+                "filename": drime_key.split("/")[-1],
+                "clientExtension": extension,
+                "relativePath": filename,
+                "workspaceId": 0,
+                "size": final_size,
+            }
+            if parent_id is not None:
+                entry_data["parentId"] = parent_id
+            
+            self.client._request("POST", "/s3/entries", json=entry_data)
+            
+            res_data = {
+                "Location": f"http://localhost:8080/{bucket}/{key}",
+                "Bucket": bucket,
+                "Key": key,
+                "ETag": '"complete"'
+            }
+            return self.send_response(start_response, "200 OK", create_xml_response("CompleteMultipartUploadResult", res_data))
+
+        except Exception as e:
+            logger.error(f"Complete Failed: {e}")
+            return self.send_error(start_response, "500 Internal Error", "InternalError", str(e))
+
+    def handle_abort_multipart_upload(self, environ, start_response, bucket, key, upload_id):
+        try:
+            drime_uid, drime_key = self._decode_multipart_id(upload_id)
+            self.client._request("POST", "/s3/multipart/abort", json={"key": drime_key, "uploadId": drime_uid})
+            # Cleanup cache
+            self._upload_size_cache.pop(drime_uid, None)
+            self._upload_parts_sizes.pop(drime_uid, None)
+            return self.send_response(start_response, "204 No Content", b"")
+        except Exception as e:
+            return self.send_error(start_response, "500 Internal Error", "InternalError", str(e))
     
     def handle_service(self, environ, start_response):
         """List buckets."""
@@ -399,7 +676,101 @@ class S3Gateway:
         # Check if this is a CopyObject request
         copy_source = environ.get("HTTP_X_AMZ_COPY_SOURCE")
         if copy_source:
-            return self.handle_copy_object(environ, start_response, bucket, key, copy_source)
+             from urllib.parse import unquote
+             # Parse copy source: /bucket/key or bucket/key
+             copy_source = unquote(copy_source).lstrip("/")
+             if "/" in copy_source:
+                 src_bucket, src_key = copy_source.split("/", 1)
+             else:
+                 return self.send_error(start_response, "400 Bad Request", "InvalidArgument", "Invalid copy source")
+             
+             logger.info(f"CopyObject: {src_bucket}/{src_key} -> {bucket}/{key}")
+             
+             # Resolve source
+             src_entry, _, _ = self._resolve_key(src_key)
+             if not src_entry:
+                 return self.send_error(start_response, "404 Not Found", "NoSuchKey", "Source key not found")
+             if src_entry.is_folder:
+                 return self.send_error(start_response, "400 Bad Request", "InvalidRequest", "Cannot copy folder")
+             
+             # Download source to temp file
+             download_url = None
+             if src_entry.url:
+                 if src_entry.url.startswith("http"):
+                     download_url = src_entry.url
+                 else:
+                     base = self.client.api_url.replace("/api/v1", "")
+                     download_url = f"{base}/{src_entry.url}"
+             if not download_url:
+                 download_url = self.client.get_download_url(src_entry.id)
+             
+             headers = {"Authorization": f"Bearer {self.client.api_key}"}
+             
+             try:
+                 response = httpx.get(download_url, headers=headers, follow_redirects=True, timeout=300)
+                 if response.status_code != 200:
+                     return self.send_error(start_response, "500 Internal Error", "CopyFailed", "Download failed")
+                 
+                 data = response.content
+                 
+                 # Calculate MD5
+                 file_md5 = hashlib.md5(data)
+                 md5_hex = file_md5.hexdigest()
+                 
+                 # Save to temp file
+                 with tempfile.NamedTemporaryFile(delete=False, prefix="s3copy_") as tmp:
+                     tmp.write(data)
+                     tmp_path = tmp.name
+                 
+                 # Ensure destination folder exists
+                 dirname = os.path.dirname(key)
+                 basename = os.path.basename(key)
+                 
+                 try:
+                     parent_id = self._ensure_folder(dirname) if dirname else None
+                 except:
+                     parent_id = None
+                 
+                 # Rename temp file
+                 final_path = os.path.join(os.path.dirname(tmp_path), basename)
+                 shutil.move(tmp_path, final_path)
+                 
+                 # Delete existing destination if any
+                 existing, _, _ = self._resolve_key(key)
+                 if existing:
+                     self.client.delete_files([existing.id])
+                 
+                 # Upload
+                 rel_path = key if parent_id is None else basename
+                 resp = self.client.upload_file(Path(final_path), rel_path, parent_id)
+                 
+                 # Store MD5
+                 uploaded_id = None
+                 if isinstance(resp, dict):
+                     if "file" in resp:
+                         uploaded_id = resp["file"].get("id")
+                     elif "fileEntry" in resp:
+                         uploaded_id = resp["fileEntry"].get("id")
+                 
+                 if uploaded_id:
+                     self.metadata[str(uploaded_id)] = md5_hex
+                     self._save_metadata()
+                 
+                 os.unlink(final_path)
+                 
+                 # Return CopyObject response
+                 etag = f'"{md5_hex}"'
+                 copy_result = {
+                     "ETag": etag,
+                     "LastModified": format_iso_date(src_entry.updated_at),
+                 }
+                 xml = create_xml_response("CopyObjectResult", copy_result)
+                 return self.send_response(start_response, "200 OK", xml)
+                 
+             except Exception as e:
+                 logger.exception("Copy error")
+                 return self.send_error(start_response, "500 Internal Error", "CopyFailed", str(e))
+
         
         try:
             content_length = int(environ.get("CONTENT_LENGTH", 0))
@@ -511,12 +882,12 @@ class S3Gateway:
             return self.send_response(start_response, "204 No Content", b"")
         except Exception as e:
             return self.send_error(start_response, "500 Internal Error", "DeleteFailed", str(e))
-    
+
     def handle_head_object(self, environ, start_response, bucket, key):
         """Get object metadata."""
         entry, _, _ = self._resolve_key(key)
         if not entry:
-            return self.send_error(start_response, "404 Not Found", "NoSuchKey", "Key not found")
+            return self.send_error(start_response, "404 Not Found", "NoSuchKey", "Key not found", include_body=False)
         
         # Format Last-Modified as RFC 2822
         last_modified = format_http_date(entry.updated_at)
@@ -529,103 +900,5 @@ class S3Gateway:
         ]
         start_response("200 OK", headers)
         return []
-    def handle_copy_object(self, environ, start_response, bucket, key, copy_source):
-        """Copy an object from source to destination."""
-        from urllib.parse import unquote
-        
-        # Parse copy source: /bucket/key or bucket/key
-        copy_source = unquote(copy_source).lstrip("/")
-        if "/" in copy_source:
-            src_bucket, src_key = copy_source.split("/", 1)
-        else:
-            return self.send_error(start_response, "400 Bad Request", "InvalidArgument", "Invalid copy source")
-        
-        logger.info(f"CopyObject: {src_bucket}/{src_key} -> {bucket}/{key}")
-        
-        # Resolve source
-        src_entry, _, _ = self._resolve_key(src_key)
-        if not src_entry:
-            return self.send_error(start_response, "404 Not Found", "NoSuchKey", "Source key not found")
-        if src_entry.is_folder:
-            return self.send_error(start_response, "400 Bad Request", "InvalidRequest", "Cannot copy folder")
-        
-        # Download source to temp file
-        download_url = None
-        if src_entry.url:
-            if src_entry.url.startswith("http"):
-                download_url = src_entry.url
-            else:
-                base = self.client.api_url.replace("/api/v1", "")
-                download_url = f"{base}/{src_entry.url}"
-        if not download_url:
-            download_url = self.client.get_download_url(src_entry.id)
-        
-        headers = {"Authorization": f"Bearer {self.client.api_key}"}
-        
-        try:
-            response = httpx.get(download_url, headers=headers, follow_redirects=True, timeout=300)
-            if response.status_code != 200:
-                return self.send_error(start_response, "500 Internal Error", "CopyFailed", "Download failed")
-            
-            data = response.content
-            
-            # Calculate MD5
-            file_md5 = hashlib.md5(data)
-            md5_hex = file_md5.hexdigest()
-            
-            # Save to temp file
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, prefix="s3copy_") as tmp:
-                tmp.write(data)
-                tmp_path = tmp.name
-            
-            # Ensure destination folder exists
-            dirname = os.path.dirname(key)
-            basename = os.path.basename(key)
-            
-            try:
-                parent_id = self._ensure_folder(dirname) if dirname else None
-            except:
-                parent_id = None
-            
-            # Rename temp file
-            final_path = os.path.join(os.path.dirname(tmp_path), basename)
-            shutil.move(tmp_path, final_path)
-            
-            # Delete existing destination if any
-            existing, _, _ = self._resolve_key(key)
-            if existing:
-                self.client.delete_files([existing.id])
-            
-            # Upload
-            rel_path = key if parent_id is None else basename
-            resp = self.client.upload_file(Path(final_path), rel_path, parent_id)
-            
-            # Store MD5
-            uploaded_id = None
-            if isinstance(resp, dict):
-                if "file" in resp:
-                    uploaded_id = resp["file"].get("id")
-                elif "fileEntry" in resp:
-                    uploaded_id = resp["fileEntry"].get("id")
-            
-            if uploaded_id:
-                self.metadata[str(uploaded_id)] = md5_hex
-                self._save_metadata()
-            
-            os.unlink(final_path)
-            
-            # Return CopyObject response
-            etag = f'"{md5_hex}"'
-            copy_result = {
-                "ETag": etag,
-                "LastModified": format_iso_date(src_entry.updated_at),
-            }
-            xml = create_xml_response("CopyObjectResult", copy_result)
-            return self.send_response(start_response, "200 OK", xml)
-            
-        except Exception as e:
-            logger.exception("Copy error")
-            return self.send_error(start_response, "500 Internal Error", "CopyFailed", str(e))
 
 

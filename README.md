@@ -19,6 +19,10 @@ pip install .
 
 ## Usage
 
+- By default the bucket name is 'default'
+- API key and secret can be a random string, I prefer to use drime/drime, just to know where I'm pointing
+
+
 ```bash
 # Set your API key
 export DRIME_API_KEY="your-api-key"
@@ -71,6 +75,7 @@ docker run -e DRIME_API_KEY=your-key -p 8081:8081 drime-s3
 - Duplicati Backup
 - S3 Browser
 - Restic
+- Rclone
 
 ## License
 
