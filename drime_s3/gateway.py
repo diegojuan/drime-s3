@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import base64
+import threading
 import tempfile
 from email.utils import formatdate
 from pathlib import Path
@@ -20,6 +21,10 @@ from .api import DrimeClient
 from .models import FileEntry
 
 logger = logging.getLogger(__name__)
+
+# Buffer size for streaming operations (256 KB)
+# Higher values improve throughput for large files
+STREAM_CHUNK_SIZE = 262144
 
 def format_http_date(iso_date: str) -> str:
     """Convert ISO 8601 date to HTTP date format (RFC 2822)."""
@@ -96,8 +101,42 @@ class S3Gateway:
         
         # Multipart Parts Size Tracker (UploadID -> {PartNum: Size}) - accumulated during upload
         self._upload_parts_sizes: Dict[str, Dict[int, int]] = {}
+        
+        # Metadata Cache (FolderID -> (timestamp, entries))
+        self._list_cache: Dict[Optional[int], Tuple[float, List[Any]]] = {}
+        self._cache_lock = threading.Lock()
+
+    def _cached_list_folder(self, folder_id: Optional[int]) -> List[Any]:
+        """List folder with short TTL cache and thread safety."""
+        import time
+        now = time.time()
+        
+        # Fast read (optimistic)
+        with self._cache_lock:
+             if folder_id in self._list_cache:
+                ts, entries = self._list_cache[folder_id]
+                if now - ts < 5.0:
+                     return entries
+        
+        # Fetch (outside lock? no, we want to prevent stampede, so keep lock or use double-check)
+        # Using simple lock for safety to prevent 32 simultaneous API calls
+        with self._cache_lock:
+             # Double check
+             if folder_id in self._list_cache:
+                ts, entries = self._list_cache[folder_id]
+                if now - ts < 5.0:
+                     return entries
+             
+             # Real Fetch
+             entries = self.client.list_folder(folder_id)
+             self._list_cache[folder_id] = (now, entries)
+             return entries
+
     
     def _load_metadata(self):
+    # ... (rest of _load_metadata)
+
+    # ... (later updates to _resolve_key)
         try:
             if self.metadata_file.exists():
                 with open(self.metadata_file) as f:
@@ -154,25 +193,44 @@ class S3Gateway:
         
         parent_id = None
         if parent_path:
-            # Walk the path
-            parent_parts = parent_path.split("/")
-            current_pid = None
-            
-            for folder_name in parent_parts:
-                entries = self.client.list_folder(current_pid)
-                found = None
-                for e in entries:
-                    if e.name.lower() == folder_name.lower() and e.is_folder:
-                        found = e
-                        break
-                if found:
-                    current_pid = found.id
-                else:
-                    return None, None, entry_name
-            parent_id = current_pid
+            # Fast Path: Check Folder Cache
+            if parent_path in self._folder_cache:
+                parent_id = self._folder_cache[parent_path]
+            else:
+                # Slow Path: Walk
+                parent_parts = parent_path.split("/")
+                current_pid = None
+                current_path_build = ""
+                
+                for folder_name in parent_parts:
+                    # Build path key for caching intermediate levels
+                    if current_path_build:
+                        current_path_build += "/" + folder_name
+                    else:
+                        current_path_build = folder_name
+                    
+                    # Check cache for this level
+                    if current_path_build in self._folder_cache:
+                        current_pid = self._folder_cache[current_path_build]
+                        continue
+
+                    entries = self._cached_list_folder(current_pid)
+                    found = None
+                    for e in entries:
+                        if e.name.lower() == folder_name.lower() and e.is_folder:
+                            found = e
+                            break
+                    if found:
+                        current_pid = found.id
+                        self._folder_cache[current_path_build] = current_pid
+                    else:
+                        return None, None, entry_name
+                
+                parent_id = current_pid
+                self._folder_cache[parent_path] = parent_id
         
         # Find entry in parent
-        entries = self.client.list_folder(parent_id)
+        entries = self._cached_list_folder(parent_id)
         for e in entries:
             if e.name == entry_name:
                 return e, parent_id, entry_name
@@ -188,7 +246,7 @@ class S3Gateway:
         current_pid = None
         
         for folder_name in parts:
-            entries = self.client.list_folder(current_pid)
+            entries = self._cached_list_folder(current_pid)
             found = None
             for e in entries:
                 if e.name.lower() == folder_name.lower() and e.is_folder:
@@ -416,7 +474,7 @@ class S3Gateway:
             stream = environ["wsgi.input"]
             def input_reader():
                 while True:
-                    chunk = stream.read(8192)
+                    chunk = stream.read(STREAM_CHUNK_SIZE)
                     if not chunk:
                         break
                     yield chunk
@@ -623,20 +681,19 @@ class S3Gateway:
         return self.send_response(start_response, "200 OK", create_xml_response("ListBucketResult", response_data))
     
     def handle_get_object(self, environ, start_response, bucket, key):
-        """Download object."""
+        """Download object with streaming."""
         entry, _, _ = self._resolve_key(key)
         if not entry:
             return self.send_error(start_response, "404 Not Found", "NoSuchKey", "Key not found")
         if entry.is_folder:
             return self.send_error(start_response, "400 Bad Request", "InvalidRequest", "Cannot download folder")
         
-        # Use entry.url if available, otherwise construct download URL
+        # Determine URL
         download_url = None
         if entry.url:
             if entry.url.startswith("http"):
                 download_url = entry.url
             else:
-                # Relative URL like "api/v1/file-entries/ID/..."
                 base = self.client.api_url.replace("/api/v1", "")
                 download_url = f"{base}/{entry.url}"
         
@@ -645,28 +702,64 @@ class S3Gateway:
         
         headers = {"Authorization": f"Bearer {self.client.api_key}"}
         
-        # Download to buffer to get accurate Content-Length
+        # Propagate Range header for partial downloads (Rclone multi-thread)
+        range_header = environ.get("HTTP_RANGE")
+        if range_header:
+            headers["Range"] = range_header
+        
         try:
-            response = httpx.get(download_url, headers=headers, follow_redirects=True, timeout=300)
-            if response.status_code != 200:
+            # Create a localized client for streaming to avoid context issues
+            # Must follow redirects (302) to reach R2 signed URL
+            client = httpx.Client(timeout=None, follow_redirects=True)
+            
+            # Send stream request
+            req = client.build_request("GET", download_url, headers=headers)
+            response = client.send(req, stream=True)
+            
+            # Allow 200 OK and 206 Partial Content
+            if response.status_code not in [200, 206]:
+                response.close()
+                client.close()
                 return self.send_error(start_response, "500 Internal Error", "DownloadFailed", f"Status {response.status_code}")
-            
-            data = response.content
-            
-            import hashlib
-            get_md5 = hashlib.md5(data).hexdigest()
+
+            # Propagation of Upstream Headers
+            content_length = response.headers.get("Content-Length", str(entry.file_size))
+            content_type = response.headers.get("Content-Type", entry.mime or "application/octet-stream")
+            etag = self._get_etag(entry)
             
             resp_headers = [
-                ("Content-Type", entry.mime or "application/octet-stream"),
-                ("Content-Length", str(len(data))),
+                ("Content-Type", content_type),
+                ("Content-Length", content_length),
                 ("Last-Modified", format_http_date(entry.updated_at)),
-                ("ETag", self._get_etag(entry)),
+                ("ETag", etag),
+                ("Accept-Ranges", "bytes"), # Advertise Range support
             ]
-            start_response("200 OK", resp_headers)
-            return [data]
+            
+            # Propagate Content-Range if present (for 206)
+            if "Content-Range" in response.headers:
+                resp_headers.append(("Content-Range", response.headers["Content-Range"]))
+            
+            # Use upstream status code (200 or 206)
+            status_text = "200 OK" if response.status_code == 200 else "206 Partial Content"
+            
+            start_response(status_text, resp_headers)
+
+            
+            # Streaming Generator
+            def stream_generator():
+                try:
+                    for chunk in response.iter_bytes(chunk_size=STREAM_CHUNK_SIZE):
+                        yield chunk
+                finally:
+                    response.close()
+                    client.close()
+
+            return stream_generator()
+
         except Exception as e:
             logger.exception("Download error")
             return self.send_error(start_response, "500 Internal Error", "DownloadFailed", str(e))
+
 
     def handle_put_object(self, environ, start_response, bucket, key):
         """Upload object or copy object."""
@@ -820,7 +913,7 @@ class S3Gateway:
                 elif content_length > 0:
                     left = content_length
                     while left > 0:
-                        data = stream.read(min(left, 8192))
+                        data = stream.read(min(left, STREAM_CHUNK_SIZE))
                         if not data:
                             break
                         file_md5.update(data)
@@ -828,7 +921,7 @@ class S3Gateway:
                         left -= len(data)
                 else:
                     while True:
-                        data = stream.read(8192)
+                        data = stream.read(STREAM_CHUNK_SIZE)
                         if not data:
                             break
                         file_md5.update(data)

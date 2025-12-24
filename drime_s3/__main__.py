@@ -30,7 +30,8 @@ def main():
         sys.exit(1)
     
     app = S3Gateway(client)
-    server = WSGIServer((args.host, args.port), app)
+    # Increase thread pool to support high concurrency (e.g. restic -o s3.connections=32)
+    server = WSGIServer((args.host, args.port), app, numthreads=100)
     
     print(f"Drime S3 Gateway running on http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop")
